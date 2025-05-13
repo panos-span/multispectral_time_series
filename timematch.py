@@ -496,7 +496,8 @@ def display_confusion_matrix(conf_matrix, class_names, fold_num):
         # Check if folder exists, if not create it
         os.makedirs("./plots", exist_ok=True)
         # Save the figure
-        plt.savefig(f"./plots/confusion_matrix_fold{fold_num}.png")
+        plot_path = Path("./plots") / f"confusion_matrix_fold{fold_num}.png"
+        plt.savefig(plot_path)
         plt.close()
         print(
             f"Saved confusion matrix for fold {fold_num} to confusion_matrix_fold{fold_num}.png"
@@ -678,6 +679,27 @@ def validate(model, loader, criterion, device, metrics=None):
     return avg_loss, metrics_results, confusion_matrix, all_attention
 
 
+def plot_fold_history(history, fold_num, output_dir="plots/history"):
+    """Plots training and validation loss and a key metric over epochs for a fold."""
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    save_path_loss = Path(output_dir) / f"loss_curve_fold_{fold_num}.png"
+
+    epochs = range(1, len(history["train_loss"]) + 1)
+
+    # Plot Loss
+    plt.figure(figsize=(10, 5))
+    plt.plot(epochs, history["train_loss"], "bo-", label="Training Loss")
+    plt.plot(epochs, history["val_loss"], "ro-", label="Validation Loss")
+    plt.title(f"Fold {fold_num}: Training and Validation Loss")
+    plt.xlabel("Epochs")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(save_path_loss)
+    plt.close()
+    print(f"Saved loss curve for fold {fold_num} to {save_path_loss}")
+
+
 def train_validate_fold(
     fold_num,
     train_loader,
@@ -724,7 +746,7 @@ def train_validate_fold(
         # Print training metrics
         print(f"Training: loss={train_loss:.4f}, time={train_time:.2f}s")
         for name, value in train_metrics_results.items():
-            print(f"  {name}={value:.4f}", end="")
+            print(f"  {name}={value:.4f}", end="\n")
         print()
 
         # Validate
@@ -746,7 +768,7 @@ def train_validate_fold(
 
         # Update learning rate
         if scheduler is not None:
-            scheduler.step()
+            scheduler.step(val_loss)
 
         # Check for improvement
         current_val_f1 = val_metrics_results.get("val_f1_weighted", 0.0)
@@ -780,6 +802,9 @@ def train_validate_fold(
     if best_confusion_matrix is not None:
         class_names = list(idx_to_crop.values())
         display_confusion_matrix(best_confusion_matrix, class_names, fold_num + 1)
+        
+    # Plot training history
+    plot_fold_history(history, fold_num + 1) # Pass fold_num+1 for 1-based display
 
     # Final validation metrics from the best model
     best_metrics = history["val_metrics"][best_epoch]
@@ -812,8 +837,14 @@ def run_k_fold_cross_validation(fold_loaders, num_classes, idx_to_crop):
         )
 
         # Learning rate scheduler
+        # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        #    optimizer, T_max=NUM_EPOCHS
+        # )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, T_max=NUM_EPOCHS
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=EARLY_STOPPING_PATIENCE // 2,
         )
 
         # Train and validate
@@ -835,13 +866,15 @@ def run_k_fold_cross_validation(fold_loaders, num_classes, idx_to_crop):
         all_fold_metrics.append(fold_metrics)
 
         # Save model for this fold
+        os.makedirs("models", exist_ok=True)
+        fold_model_path = Path("models") / f"model_fold{fold_idx+1}.pt"
         torch.save(
             {
                 "model_state_dict": model.state_dict(),
                 "fold_metrics": fold_metrics,
                 "fold_history": fold_history,
             },
-            f"model_fold{fold_idx+1}.pt",
+            fold_model_path,
         )
 
     # Calculate aggregate metrics
@@ -905,14 +938,20 @@ if __name__ == "__main__":
             fold_loaders=fold_loaders, num_classes=num_classes, idx_to_crop=idx_to_crop
         )
 
-        # Print final summary
+        # Print final summary and save it in a text file
         print("\n--- Final Results Summary ---")
         print(f"Mean Validation Metrics across {NUM_FOLDS} Folds:")
-        for metric, value in sorted(results["mean_metrics"].items()):
-            print(f"  {metric}: {value:.4f} ± {results['std_metrics'][metric]:.4f}")
+        file_path = Path("results_summary.txt")
+        with open(file_path, "w") as f:
+            f.write("Mean Validation Metrics across {NUM_FOLDS} Folds:\n")
+            for metric, value in sorted(results["mean_metrics"].items()):
+                print(f"  {metric}: {value:.4f} ± {results['std_metrics'][metric]:.4f}")
+                f.write(
+                    f"  {metric}: {value:.4f} ± {results['std_metrics'][metric]:.4f}\n"
+                )
     else:
         print("Error: No data loaders were created.")
-    
+
     # Save the best final fold results
     if results and "all_fold_metrics" in results:
         best_fold_metrics = max(
