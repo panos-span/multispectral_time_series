@@ -1,33 +1,32 @@
+import math
 import os
+import time
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import pandas as pd
-import math
-from tqdm import tqdm
-from pathlib import Path
-import time
 
 # Import TorchMetrics
-from torchmetrics import Accuracy, Precision, Recall, F1Score, ConfusionMatrix
+from torchmetrics import Accuracy, ConfusionMatrix, F1Score, Precision, Recall
+from tqdm import tqdm
 
 # Import from our data_loader.py
 from data_loader import (
-    preprocess_dataset,
-    create_k_fold_loaders,
-    set_random_seeds,
-    INPUT_CHANNELS,
-    NUM_TIMESTEPS,
-    NUM_FOLDS,
     BATCH_SIZE,
-    NUM_WORKERS,
-    RANDOM_SEED,
-    PIXEL_NORMALIZATION_MAX,
     DATA_PATH,
+    INPUT_CHANNELS,
+    NUM_FOLDS,
     NUM_PIXELS_SAMPLE,
+    NUM_WORKERS,
+    PIXEL_NORMALIZATION_MAX,
+    RANDOM_SEED,
+    create_k_fold_loaders,
+    preprocess_dataset,
+    set_random_seeds,
 )
 
 # --- Configuration ---
@@ -56,9 +55,9 @@ CLASSIFIER_HIDDEN_DIMS = [64, 32]
 CLASSIFIER_DROPOUT = 0.1
 
 # Training Configuration
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 5e-4
 WEIGHT_DECAY = 1e-4
-NUM_EPOCHS = 15
+NUM_EPOCHS = 20
 EARLY_STOPPING_PATIENCE = 5
 
 
@@ -494,7 +493,10 @@ def display_confusion_matrix(conf_matrix, class_names, fold_num):
         plt.xlabel("Predicted label")
         plt.title(f"Confusion Matrix - Fold {fold_num}")
         plt.tight_layout()
-        plt.savefig(f"confusion_matrix_fold{fold_num}.png")
+        # Check if folder exists, if not create it
+        os.makedirs("./plots", exist_ok=True)
+        # Save the figure
+        plt.savefig(f"./plots/confusion_matrix_fold{fold_num}.png")
         plt.close()
         print(
             f"Saved confusion matrix for fold {fold_num} to confusion_matrix_fold{fold_num}.png"
@@ -910,5 +912,19 @@ if __name__ == "__main__":
             print(f"  {metric}: {value:.4f} ± {results['std_metrics'][metric]:.4f}")
     else:
         print("Error: No data loaders were created.")
+    
+    # Save the best final fold results
+    if results and "all_fold_metrics" in results:
+        best_fold_metrics = max(
+            results["all_fold_metrics"], key=lambda x: x.get("val_f1_weighted", 0)
+        )
+        print("\nBest Fold Metrics:")
+        for metric, value in sorted(best_fold_metrics.items()):
+            print(f"  {metric}: {value:.4f}")
+        display_confusion_matrix(
+            best_fold_metrics.get("confusion_matrix"),
+            list(idx_to_crop.values()),
+            fold_num=NUM_FOLDS,
+        )
 
     print("\n--- Done! ---")
