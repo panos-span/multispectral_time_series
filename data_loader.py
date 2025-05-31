@@ -31,7 +31,6 @@ from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, Dataset, Subset
 
 # --- Configuration ---
-#BASE_DATA_PATH = "./timematch_data"
 BASE_DATA_PATH = Path("timematch_data")
 REGION = "denmark"
 TILE = "32VNH"
