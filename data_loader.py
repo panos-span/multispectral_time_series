@@ -27,7 +27,7 @@ import functools
 import numpy as np
 import torch
 import zarr
-from sklearn.model_selection import KFold
+from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader, Dataset, Subset
 
 # --- Configuration ---
@@ -505,12 +505,14 @@ def create_k_fold_loaders(
     """
     # Set random seed for reproducibility
     set_random_seeds(random_seed)
-
+    
+    # We need an array of integer labels corresponding to parcel_ids for StratifiedKFold
+    # The order of parcel_ids and y_labels must match.
+    y_labels = np.array([crop_to_idx[labels_dict[pid]] for pid in parcel_ids])
+    parcel_ids_array = np.array(parcel_ids) # Keep parcel_ids as an array for indexing
+    
     # Create KFold object
-    kf = KFold(n_splits=num_folds, shuffle=True, random_state=random_seed)
-
-    # Convert parcel_ids to indices for KFold
-    indices = np.arange(len(parcel_ids))
+    skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=random_seed)
 
     # Create dataset
     full_dataset = TimeMatchDataset(
@@ -523,16 +525,20 @@ def create_k_fold_loaders(
     # Create fold loaders
     fold_loaders = []
 
-    for fold, (train_indices, val_indices) in enumerate(kf.split(indices)):
-        print(f"\nCreating loaders for fold {fold+1}/{num_folds}")
-
-        # Get train and val parcel indices
-        train_parcel_indices = indices[train_indices]
-        val_parcel_indices = indices[val_indices]
-
+    for fold, (train_indices, val_indices) in enumerate(skf.split(parcel_ids_array, y_labels)):
+        print(f"\nCreating loaders for fold {fold+1}/{num_folds} (Stratified)")
+        
         # Create subsets
-        train_subset = Subset(full_dataset, train_parcel_indices)
-        val_subset = Subset(full_dataset, val_parcel_indices)
+        # These indices refer to the positions in parcel_ids_array (and thus full_dataset if parcel_ids was used to construct it)
+        train_subset = Subset(full_dataset, train_indices)
+        val_subset = Subset(full_dataset, val_indices)
+        
+        # --- Print class distribution for verification (optional but good for debugging) ---
+        train_subset_labels = [full_dataset[i]['label'] for i in train_indices]
+        val_subset_labels = [full_dataset[i]['label'] for i in val_indices]
+        print(f"  Fold {fold+1} Training Class Counts: {Counter(train_subset_labels)}")
+        print(f"  Fold {fold+1} Validation Class Counts: {Counter(val_subset_labels)}")
+        print("-"*50)
 
         print(f"  Training set: {len(train_subset)} parcels")
         print(f"  Validation set: {len(val_subset)} parcels")
@@ -626,7 +632,6 @@ if __name__ == "__main__":
     # Set random seeds for reproducibility
     random_seed = RANDOM_SEED
     set_random_seeds(random_seed)
-    print(f"Random seed set to: {random_seed}")
 
     # 1. Preprocess dataset
     (
