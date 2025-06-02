@@ -1,3 +1,4 @@
+# timematch.py - Updated with Fast Loading Support
 import math
 import os
 import time
@@ -10,11 +11,10 @@ import seaborn as sns
 import torch
 import torch.nn as nn
 
-# Import TorchMetrics
 from torchmetrics import Accuracy, ConfusionMatrix, F1Score, Precision, Recall
 from tqdm import tqdm
 
-# Import from our data_loader.py
+# Updated imports for enhanced normalization and fast loading
 from data_loader import (
     BATCH_SIZE,
     DATA_PATH,
@@ -22,32 +22,36 @@ from data_loader import (
     NUM_FOLDS,
     NUM_PIXELS_SAMPLE,
     NUM_WORKERS,
-    PIXEL_NORMALIZATION_MAX,
     RANDOM_SEED,
-    create_k_fold_loaders,
-    preprocess_dataset,
+    NORMALIZATION_STRATEGY,
+    create_enhanced_k_fold_loaders,
+    preprocess_dataset_with_normalization,
+    load_preprocessed_data,          # New import
+    check_preprocessed_data_exists,  # New import
     set_random_seeds,
 )
 
 # --- Configuration ---
+# Fast loading option - set to True to load preprocessed data directly
+USE_FAST_LOADING = True  # Set to False to always preprocess from scratch
+
 # Set device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
 # Set random seeds for reproducibility
 set_random_seeds(RANDOM_SEED)
-print(f"Random seed set to: {RANDOM_SEED}")
 
 # PSE Configuration
 PSE_MLP1_DIMS = [32, 64]
-PSE_MLP2_DIMS = [128]
-PSE_OUTPUT_DIM = PSE_MLP2_DIMS[-1]  # Output dimension from PSE
+PSE_MLP2_DIMS = [256, 128]         
+PSE_OUTPUT_DIM = PSE_MLP2_DIMS[-1]
 
-# LTAE Configuration (Lightweight Temporal Attention Encoder)
+# LTAE Configuration
 LTAE_D_MODEL = PSE_OUTPUT_DIM
 LTAE_NHEAD = 8
-LTAE_D_K = 16  # Key dimension for each head
-LTAE_MLP_DIMS = [256, 128]  # MLP dimensions after attention
+LTAE_D_K = 16
+LTAE_MLP_DIMS = [512, 256, 128]
 LTAE_DROPOUT = 0.2
 
 # Classifier Head Configuration
@@ -61,7 +65,7 @@ NUM_EPOCHS = 20
 EARLY_STOPPING_PATIENCE = 5
 
 
-# --- Model Components ---
+# --- Model Components (unchanged from previous version) ---
 class MLP(nn.Module):
     """Simple MLP module with batch normalization and activation."""
 
@@ -80,7 +84,6 @@ class MLP(nn.Module):
 
         for i in range(len(dims) - 1):
             layers.append(nn.Linear(dims[i], dims[i + 1]))
-            # No BatchNorm or activation after the last layer
             if i < len(dims) - 2:
                 if use_batchnorm:
                     layers.append(nn.BatchNorm1d(dims[i + 1]))
@@ -142,21 +145,21 @@ class PixelSetEncoder(nn.Module):
         x = self.mlp1(x)
 
         # Reshape back to organize by batch, time, pixels
-        F = x.shape[-1]  # Feature dimension
+        F = x.shape[-1]
         x = x.view(B * T, S, F)
 
         # Apply pooling across pixel dimension
         if self.pooling == "mean_std":
-            mean = x.mean(dim=1)  # [B*T, F]
-            std = x.std(dim=1)  # [B*T, F]
-            x_pooled = torch.cat([mean, std], dim=1)  # [B*T, 2*F]
+            mean = x.mean(dim=1)
+            std = x.std(dim=1)
+            x_pooled = torch.cat([mean, std], dim=1)
         elif self.pooling == "mean":
-            x_pooled = x.mean(dim=1)  # [B*T, F]
+            x_pooled = x.mean(dim=1)
         elif self.pooling == "max":
-            x_pooled = x.max(dim=1)[0]  # [B*T, F]
+            x_pooled = x.max(dim=1)[0]
 
         # Process pooled features with mlp2
-        x = self.mlp2(x_pooled)  # [B*T, F_out]
+        x = self.mlp2(x_pooled)
 
         # Reshape to [B, T, F_out]
         x = x.view(B, T, -1)
@@ -169,7 +172,6 @@ class SinusoidalPositionalEncoding(nn.Module):
 
     def __init__(self, d_model, max_len=366 + 1, T=1000.0):
         super().__init__()
-        # Create position encoding table
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(
@@ -186,16 +188,12 @@ class SinusoidalPositionalEncoding(nn.Module):
         Returns:
             [B, T, D] positional encodings
         """
-        # Clamp positions to valid range and convert to indices
         pos_indices = positions.clamp(0, self.pe.shape[0] - 1).long()
         return self.pe[pos_indices]
 
 
 class LightweightTemporalAttentionEncoder(nn.Module):
-    """
-    Implementation of Lightweight Temporal Attention Encoder (LTAE)
-    from the TimeMatch paper.
-    """
+    """Implementation of Lightweight Temporal Attention Encoder (LTAE)."""
 
     def __init__(
         self,
@@ -211,7 +209,6 @@ class LightweightTemporalAttentionEncoder(nn.Module):
         super().__init__()
         self.in_channels = in_channels
 
-        # Optional projection to d_model dimension
         if d_model is not None:
             self.d_model = d_model
             self.inconv = nn.Linear(in_channels, d_model)
@@ -219,28 +216,23 @@ class LightweightTemporalAttentionEncoder(nn.Module):
             self.d_model = in_channels
             self.inconv = None
 
-        # Positional encoding
         self.positional_encoding = SinusoidalPositionalEncoding(
             d_model=self.d_model, max_len=max_position, T=T
         )
 
-        # Multi-head attention
         self.attention_heads = MultiHeadAttention(
             n_head=n_head, d_k=d_k, d_in=self.d_model
         )
 
-        # MLP after attention
         layers = []
         dims = [n_head * self.d_model] + mlp_dims
         for i in range(len(dims) - 1):
             layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:  # No BN, activation after last layer
+            if i < len(dims) - 2:
                 layers.append(nn.BatchNorm1d(dims[i + 1]))
                 layers.append(nn.ReLU())
 
         self.mlp = nn.Sequential(*layers)
-
-        # Normalization and dropout
         self.inlayernorm = nn.LayerNorm(self.d_model)
         self.outlayernorm = nn.LayerNorm(mlp_dims[-1])
         self.dropout = nn.Dropout(dropout)
@@ -250,25 +242,17 @@ class LightweightTemporalAttentionEncoder(nn.Module):
         Args:
             x: [B, T, C] input features
             positions: [B, T] day-of-year positions
-
         Returns:
             [B, F] output features, [B, H, T] attention weights
         """
-        # Apply layer norm
         x = self.inlayernorm(x)
-
-        # Add positional encoding
         pos_encoding = self.positional_encoding(positions)
         enc_output = x + pos_encoding
 
-        # Optional input projection
         if self.inconv is not None:
             enc_output = self.inconv(enc_output)
 
-        # Apply attention
         enc_output, attn = self.attention_heads(enc_output, enc_output, enc_output)
-
-        # Reshape and apply MLP
         enc_output = enc_output.permute(1, 0, 2).contiguous().view(x.shape[0], -1)
         enc_output = self.outlayernorm(self.dropout(self.mlp(enc_output)))
 
@@ -276,9 +260,7 @@ class LightweightTemporalAttentionEncoder(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    """
-    Multi-head attention with a master query mechanism as used in LTAE.
-    """
+    """Multi-head attention with a master query mechanism."""
 
     def __init__(self, n_head, d_k, d_in):
         super().__init__()
@@ -286,7 +268,6 @@ class MultiHeadAttention(nn.Module):
         self.d_k = d_k
         self.d_in = d_in
 
-        # Linear projections
         self.fc1_q = nn.Linear(d_in, n_head * d_k)
         nn.init.normal_(self.fc1_q.weight, mean=0, std=np.sqrt(2.0 / d_k))
 
@@ -297,32 +278,27 @@ class MultiHeadAttention(nn.Module):
             nn.BatchNorm1d(n_head * d_k), nn.Linear(n_head * d_k, n_head * d_k)
         )
 
-        # Attention mechanism
         self.attention = ScaledDotProductAttention(temperature=np.power(d_k, 0.5))
 
     def forward(self, q, k, v):
         d_k, d_in, n_head = self.d_k, self.d_in, self.n_head
         sz_b, seq_len, _ = q.size()
 
-        # Project keys and queries
         q = self.fc1_q(q).view(sz_b, seq_len, n_head, d_k)
-        q = q.mean(dim=1).squeeze()  # MEAN query - this creates the "master query"
+        q = q.mean(dim=1).squeeze()
         q = self.fc2(q.view(sz_b, n_head * d_k)).view(sz_b, n_head, d_k)
         q = q.permute(1, 0, 2).contiguous().view(n_head * sz_b, d_k)
 
         k = self.fc1_k(k).view(sz_b, seq_len, n_head, d_k)
         k = k.permute(2, 0, 1, 3).contiguous().view(-1, seq_len, d_k)
 
-        v = v.repeat(n_head, 1, 1)  # (n*b) x seq_len x d_in
+        v = v.repeat(n_head, 1, 1)
 
-        # Apply attention
         output, attn = self.attention(q, k, v)
 
-        # Reshape output
         output = output.view(n_head, sz_b, 1, d_in)
         output = output.squeeze(dim=2)
 
-        # Reshape attention weights
         attn = attn.view(n_head, sz_b, 1, seq_len)
         attn = attn.squeeze(dim=2)
 
@@ -330,9 +306,7 @@ class MultiHeadAttention(nn.Module):
 
 
 class ScaledDotProductAttention(nn.Module):
-    """
-    Scaled Dot-Product Attention mechanism.
-    """
+    """Scaled Dot-Product Attention mechanism."""
 
     def __init__(self, temperature, attn_dropout=0.1):
         super().__init__()
@@ -341,29 +315,16 @@ class ScaledDotProductAttention(nn.Module):
         self.softmax = nn.Softmax(dim=2)
 
     def forward(self, q, k, v):
-        # q: [n_head*batch, 1, d_k]
-        # k: [n_head*batch, seq_len, d_k]
-        # v: [n_head*batch, seq_len, d_in]
-
-        # Calculate attention scores
         attn = torch.matmul(q.unsqueeze(1), k.transpose(1, 2))
         attn = attn / self.temperature
-
-        # Apply softmax and dropout
         attn = self.softmax(attn)
         attn = self.dropout(attn)
-
-        # Apply attention to values
         output = torch.matmul(attn, v)
-
         return output, attn
 
 
 class TimeMatchModel(nn.Module):
-    """
-    Complete model combining PSE and LTAE for satellite time series classification,
-    following the TimeMatch paper approach.
-    """
+    """Complete model combining PSE and LTAE for satellite time series classification."""
 
     def __init__(
         self,
@@ -382,12 +343,10 @@ class TimeMatchModel(nn.Module):
     ):
         super().__init__()
 
-        # Pixel-Set Encoder for spatial feature extraction
         self.pse = PixelSetEncoder(
             input_dim=input_channels, mlp1_dims=pse_mlp1_dims, mlp2_dims=pse_mlp2_dims
         )
 
-        # Lightweight Temporal Attention Encoder for temporal feature extraction
         self.ltae = LightweightTemporalAttentionEncoder(
             in_channels=pse_mlp2_dims[-1],
             d_model=ltae_d_model,
@@ -398,7 +357,6 @@ class TimeMatchModel(nn.Module):
             max_position=max_position,
         )
 
-        # Final classifier
         self.classifier = MLP(
             input_dim=ltae_mlp_dims[-1],
             hidden_dims=classifier_hidden_dims,
@@ -412,50 +370,27 @@ class TimeMatchModel(nn.Module):
         Args:
             pixels: [B, T, C, S] tensor - batch, time, channels, pixels
             positions: [B, T] tensor - batch, time positions (days of year)
-
         Returns:
             logits: [B, num_classes] - classification logits
             attention: attention weights from LTAE
         """
-        # Extract spatial features with PSE
-        x = self.pse(pixels)  # [B, T, F]
-
-        # Extract temporal features with LTAE
-        x, attention = self.ltae(x, positions)  # [B, F], [B, H, T]
-
-        # Classification
-        logits = self.classifier(x)  # [B, num_classes]
-
+        x = self.pse(pixels)
+        x, attention = self.ltae(x, positions)
+        logits = self.classifier(x)
         return logits, attention
 
 
-# --- Helper Functions ---
+# --- Helper Functions (unchanged) ---
 def initialize_metrics(num_classes, device, prefix="val"):
     """Initialize metrics dictionary for evaluation."""
     metrics = {
-        f"{prefix}_acc": Accuracy(task="multiclass", num_classes=num_classes).to(
-            device
-        ),
-        f"{prefix}_prec_micro": Precision(
-            task="multiclass", num_classes=num_classes, average="micro"
-        ).to(device),
-        f"{prefix}_recall_micro": Recall(
-            task="multiclass", num_classes=num_classes, average="micro"
-        ).to(device),
-        f"{prefix}_f1_micro": F1Score(
-            task="multiclass", num_classes=num_classes, average="micro"
-        ).to(device),
-        f"{prefix}_prec_weighted": Precision(
-            task="multiclass", num_classes=num_classes, average="weighted"
-        ).to(device),
-        f"{prefix}_recall_weighted": Recall(
-            task="multiclass", num_classes=num_classes, average="weighted"
-        ).to(device),
-        f"{prefix}_f1_weighted": F1Score(
-            task="multiclass", num_classes=num_classes, average="weighted"
-        ).to(device),
-        # We'll compute confusion matrix manually instead
-        # f'{prefix}_confmat': ConfusionMatrix(task="multiclass", num_classes=num_classes).to(device)
+        f"{prefix}_acc": Accuracy(task="multiclass", num_classes=num_classes).to(device),
+        f"{prefix}_prec_micro": Precision(task="multiclass", num_classes=num_classes, average="micro").to(device),
+        f"{prefix}_recall_micro": Recall(task="multiclass", num_classes=num_classes, average="micro").to(device),
+        f"{prefix}_f1_micro": F1Score(task="multiclass", num_classes=num_classes, average="micro").to(device),
+        f"{prefix}_prec_weighted": Precision(task="multiclass", num_classes=num_classes, average="weighted").to(device),
+        f"{prefix}_recall_weighted": Recall(task="multiclass", num_classes=num_classes, average="weighted").to(device),
+        f"{prefix}_f1_weighted": F1Score(task="multiclass", num_classes=num_classes, average="weighted").to(device),
     }
     return metrics
 
@@ -466,51 +401,33 @@ def display_confusion_matrix(conf_matrix, class_names, fold_num):
         print(f"Warning: No confusion matrix available for fold {fold_num}")
         return
 
-    # Get the number of classes in the confusion matrix
     n_classes = conf_matrix.shape[0]
 
-    # If we have more class names than classes in the confusion matrix,
-    # trim the class names
     if len(class_names) > n_classes:
         class_names = class_names[:n_classes]
-    # If we have fewer class names than classes, pad with unknown
     elif len(class_names) < n_classes:
-        class_names = list(class_names) + [
-            f"unknown_{i}" for i in range(len(class_names), n_classes)
-        ]
+        class_names = list(class_names) + [f"unknown_{i}" for i in range(len(class_names), n_classes)]
 
     df_cm = pd.DataFrame(conf_matrix, index=class_names, columns=class_names)
     plt.figure(figsize=(12, 10))
     try:
         heatmap = sns.heatmap(df_cm, annot=True, fmt="d", cmap="viridis")
-        heatmap.yaxis.set_ticklabels(
-            heatmap.yaxis.get_ticklabels(), rotation=0, ha="right", fontsize=10
-        )
-        heatmap.xaxis.set_ticklabels(
-            heatmap.xaxis.get_ticklabels(), rotation=45, ha="right", fontsize=10
-        )
+        heatmap.yaxis.set_ticklabels(heatmap.yaxis.get_ticklabels(), rotation=0, ha="right", fontsize=10)
+        heatmap.xaxis.set_ticklabels(heatmap.xaxis.get_ticklabels(), rotation=45, ha="right", fontsize=10)
         plt.ylabel("True label")
         plt.xlabel("Predicted label")
         plt.title(f"Confusion Matrix - Fold {fold_num}")
         plt.tight_layout()
-        # Check if folder exists, if not create it
         os.makedirs("./plots", exist_ok=True)
-        # Save the figure
         plot_path = Path("./plots") / f"confusion_matrix_fold{fold_num}.png"
         plt.savefig(plot_path)
         plt.close()
-        print(
-            f"Saved confusion matrix for fold {fold_num} to confusion_matrix_fold{fold_num}.png"
-        )
+        print(f"Saved confusion matrix for fold {fold_num} to confusion_matrix_fold{fold_num}.png")
     except Exception as e:
         print(f"Error generating heatmap for fold {fold_num}: {e}")
-        print("Confusion matrix shape:", conf_matrix.shape)
-        print("Class names length:", len(class_names))
-        print("First few rows of confusion matrix:")
-        print(df_cm.head())
 
 
-# --- Training and Validation Functions ---
+# --- Training and Validation Functions (unchanged) ---
 def train_epoch(model, loader, criterion, optimizer, device, metrics=None):
     """Train model for one epoch."""
     model.train()
@@ -523,7 +440,6 @@ def train_epoch(model, loader, criterion, optimizer, device, metrics=None):
 
     pbar = tqdm(loader, desc="Training")
     for batch in pbar:
-        # Get data
         pixels = batch["pixels"].to(device)
         positions = batch["positions"].to(device)
         labels = batch["label"].to(device)
@@ -532,37 +448,30 @@ def train_epoch(model, loader, criterion, optimizer, device, metrics=None):
         if batch_size == 0:
             continue
 
-        # Forward pass
         logits, _ = model(pixels, positions)
         loss = criterion(logits, labels)
 
-        # Backward pass and optimize
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        # Update metrics
         preds = torch.argmax(logits, dim=1)
         if metrics:
             for metric in metrics.values():
                 metric.update(preds, labels)
 
-        # Update statistics
         epoch_loss += loss.item() * batch_size
         samples_processed += batch_size
 
-        # Update progress bar
         if metrics and "train_acc" in metrics:
-            # Safely get accuracy for the progress bar
             try:
                 acc_val = metrics["train_acc"].compute()
-                if acc_val.numel() == 1:  # If single element tensor
+                if acc_val.numel() == 1:
                     current_acc = acc_val.item()
-                else:  # If multi-element tensor, take mean
+                else:
                     current_acc = acc_val.mean().item()
                 pbar.set_postfix({"loss": loss.item(), "acc": f"{current_acc:.4f}"})
             except Exception as e:
-                # Fallback if any error with metrics
                 pbar.set_postfix({"loss": loss.item()})
         else:
             pbar.set_postfix({"loss": loss.item()})
@@ -574,11 +483,10 @@ def train_epoch(model, loader, criterion, optimizer, device, metrics=None):
         for name, metric in metrics.items():
             if not isinstance(metric, ConfusionMatrix):
                 try:
-                    # Safely handle metric computation
                     metric_val = metric.compute()
-                    if metric_val.numel() == 1:  # If single element tensor
+                    if metric_val.numel() == 1:
                         metrics_results[name] = metric_val.item()
-                    else:  # If multi-element tensor, take mean
+                    else:
                         metrics_results[name] = metric_val.mean().item()
                 except Exception as e:
                     print(f"Warning: Could not compute metric {name}: {e}")
@@ -592,8 +500,6 @@ def validate(model, loader, criterion, device, metrics=None):
     val_loss = 0.0
     samples_processed = 0
     all_attention = []
-
-    # For manual confusion matrix calculation
     all_preds = []
     all_labels = []
 
@@ -603,7 +509,6 @@ def validate(model, loader, criterion, device, metrics=None):
 
     with torch.no_grad():
         for batch in tqdm(loader, desc="Validating"):
-            # Get data
             pixels = batch["pixels"].to(device)
             positions = batch["positions"].to(device)
             labels = batch["label"].to(device)
@@ -612,31 +517,22 @@ def validate(model, loader, criterion, device, metrics=None):
             if batch_size == 0:
                 continue
 
-            # Forward pass
             logits, attention = model(pixels, positions)
             loss = criterion(logits, labels)
 
-            # Store attention weights
             all_attention.append(attention.cpu())
-
-            # Update metrics
             preds = torch.argmax(logits, dim=1)
-
-            # Store predictions and labels for confusion matrix
             all_preds.append(preds.cpu())
             all_labels.append(labels.cpu())
 
             if metrics:
                 for name, metric in metrics.items():
-                    if not isinstance(
-                        metric, ConfusionMatrix
-                    ):  # Skip ConfusionMatrix here
+                    if not isinstance(metric, ConfusionMatrix):
                         try:
                             metric.update(preds, labels)
                         except Exception as e:
                             print(f"Warning: Could not update metric {name}: {e}")
 
-            # Update statistics
             val_loss += loss.item() * batch_size
             samples_processed += batch_size
 
@@ -645,33 +541,25 @@ def validate(model, loader, criterion, device, metrics=None):
     metrics_results = {}
     confusion_matrix = None
 
-    # Calculate metrics that are not ConfusionMatrix
     if metrics:
         for name, metric in metrics.items():
             if not isinstance(metric, ConfusionMatrix):
                 try:
-                    # Safely handle metric computation
                     metric_val = metric.compute()
-                    if metric_val.numel() == 1:  # If single element tensor
+                    if metric_val.numel() == 1:
                         metrics_results[name] = metric_val.item()
-                    else:  # If multi-element tensor, take mean
+                    else:
                         metrics_results[name] = metric_val.mean().item()
                 except Exception as e:
                     print(f"Warning: Could not compute metric {name}: {e}")
 
-    # Manually calculate confusion matrix using sklearn
     if all_preds and all_labels:
         try:
             import sklearn.metrics
-
             all_preds = torch.cat(all_preds).numpy()
             all_labels = torch.cat(all_labels).numpy()
             confusion_matrix = sklearn.metrics.confusion_matrix(
-                all_labels,
-                all_preds,
-                labels=list(
-                    range(metrics.get("val_acc", {}).num_classes if metrics else 0)
-                ),
+                all_labels, all_preds, labels=list(range(metrics.get("val_acc", {}).num_classes if metrics else 0))
             )
         except Exception as e:
             print(f"Warning: Could not compute confusion matrix: {e}")
@@ -680,13 +568,12 @@ def validate(model, loader, criterion, device, metrics=None):
 
 
 def plot_fold_history(history, fold_num, output_dir="plots/history"):
-    """Plots training and validation loss and a key metric over epochs for a fold."""
+    """Plots training and validation loss over epochs for a fold."""
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     save_path_loss = Path(output_dir) / f"loss_curve_fold_{fold_num}.png"
 
     epochs = range(1, len(history["train_loss"]) + 1)
 
-    # Plot Loss
     plt.figure(figsize=(10, 5))
     plt.plot(epochs, history["train_loss"], "bo-", label="Training Loss")
     plt.plot(epochs, history["val_loss"], "ro-", label="Validation Loss")
@@ -717,11 +604,9 @@ def train_validate_fold(
     """Train and validate model for one fold with early stopping."""
     print(f"\n----- Fold {fold_num + 1}/{NUM_FOLDS} -----")
 
-    # Initialize metrics
     train_metrics = initialize_metrics(num_classes, device, prefix="train")
     val_metrics = initialize_metrics(num_classes, device, prefix="val")
 
-    # Initialize best model tracking
     best_val_f1 = 0.0
     best_epoch = 0
     patience_counter = 0
@@ -732,45 +617,37 @@ def train_validate_fold(
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch+1}/{num_epochs}")
 
-        # Train
         start_time = time.time()
         train_loss, train_metrics_results = train_epoch(
             model, train_loader, criterion, optimizer, device, train_metrics
         )
         train_time = time.time() - start_time
 
-        # Store training history
         history["train_loss"].append(train_loss)
         history["train_metrics"].append(train_metrics_results)
 
-        # Print training metrics
         print(f"Training: loss={train_loss:.4f}, time={train_time:.2f}s")
         for name, value in train_metrics_results.items():
             print(f"  {name}={value:.4f}", end="\n")
         print()
 
-        # Validate
         start_time = time.time()
         val_loss, val_metrics_results, confusion_mat, _ = validate(
             model, val_loader, criterion, device, val_metrics
         )
         val_time = time.time() - start_time
 
-        # Store validation history
         history["val_loss"].append(val_loss)
         history["val_metrics"].append(val_metrics_results)
 
-        # Print validation metrics
         print(f"Validation: loss={val_loss:.4f}, time={val_time:.2f}s")
         for name, value in val_metrics_results.items():
             print(f"  {name}={value:.4f}", end="\n")
         print()
 
-        # Update learning rate
         if scheduler is not None:
             scheduler.step(val_loss)
 
-        # Check for improvement
         current_val_f1 = val_metrics_results.get("val_f1_weighted", 0.0)
         if current_val_f1 > best_val_f1:
             best_val_f1 = current_val_f1
@@ -781,32 +658,23 @@ def train_validate_fold(
             print(f"New best model! F1={best_val_f1:.4f}")
         else:
             patience_counter += 1
-            print(
-                f"No improvement for {patience_counter}/{early_stopping_patience} epochs"
-            )
+            print(f"No improvement for {patience_counter}/{early_stopping_patience} epochs")
 
-            # Early stopping
             if patience_counter >= early_stopping_patience:
                 print(f"Early stopping triggered after epoch {epoch+1}")
                 break
 
-    # Restore best model
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
 
-    print(
-        f"\nFold {fold_num + 1} completed. Best val F1: {best_val_f1:.4f} at epoch {best_epoch+1}"
-    )
+    print(f"\nFold {fold_num + 1} completed. Best val F1: {best_val_f1:.4f} at epoch {best_epoch+1}")
 
-    # Display confusion matrix
     if best_confusion_matrix is not None:
         class_names = list(idx_to_crop.values())
         display_confusion_matrix(best_confusion_matrix, class_names, fold_num + 1)
         
-    # Plot training history
-    plot_fold_history(history, fold_num + 1) # Pass fold_num+1 for 1-based display
+    plot_fold_history(history, fold_num + 1)
 
-    # Final validation metrics from the best model
     best_metrics = history["val_metrics"][best_epoch]
 
     return best_metrics, history
@@ -821,33 +689,16 @@ def run_k_fold_cross_validation(fold_loaders, num_classes, idx_to_crop):
         print(f"Starting Fold {fold_idx+1}/{len(fold_loaders)}")
         print(f"{'='*50}")
 
-        # Initialize model
         model = TimeMatchModel(num_classes=num_classes).to(DEVICE)
-
-        # Count parameters
         param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Model has {param_count:,} trainable parameters")
 
-        # Loss function
         criterion = nn.CrossEntropyLoss()
-
-        # Optimizer
-        optimizer = torch.optim.Adam(
-            model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
-        )
-
-        # Learning rate scheduler
-        # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        #    optimizer, T_max=NUM_EPOCHS
-        # )
+        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=0.5,
-            patience=EARLY_STOPPING_PATIENCE // 2,
+            optimizer, mode="min", factor=0.5, patience=EARLY_STOPPING_PATIENCE // 2,
         )
 
-        # Train and validate
         fold_metrics, fold_history = train_validate_fold(
             fold_num=fold_idx,
             train_loader=train_loader,
@@ -865,7 +716,6 @@ def run_k_fold_cross_validation(fold_loaders, num_classes, idx_to_crop):
 
         all_fold_metrics.append(fold_metrics)
 
-        # Save model for this fold
         os.makedirs("models", exist_ok=True)
         fold_model_path = Path("models") / f"model_fold{fold_idx+1}.pt"
         torch.save(
@@ -877,15 +727,9 @@ def run_k_fold_cross_validation(fold_loaders, num_classes, idx_to_crop):
             fold_model_path,
         )
 
-    # Calculate aggregate metrics
     metric_names = all_fold_metrics[0].keys()
-    mean_metrics = {
-        name: np.mean([fold[name] for fold in all_fold_metrics])
-        for name in metric_names
-    }
-    std_metrics = {
-        name: np.std([fold[name] for fold in all_fold_metrics]) for name in metric_names
-    }
+    mean_metrics = {name: np.mean([fold[name] for fold in all_fold_metrics]) for name in metric_names}
+    std_metrics = {name: np.std([fold[name] for fold in all_fold_metrics]) for name in metric_names}
 
     print("\nOverall Cross-Validation Results:")
     for name in sorted(mean_metrics.keys()):
@@ -898,10 +742,39 @@ def run_k_fold_cross_validation(fold_loaders, num_classes, idx_to_crop):
     }
 
 
+# --- Data Loading Strategy ---
+def load_or_preprocess_data():
+    """
+    Smart data loading that tries fast loading first, falls back to preprocessing.
+    
+    Returns:
+        Tuple of preprocessed data components
+    """
+    if USE_FAST_LOADING and check_preprocessed_data_exists():
+        print("\n🚀 Fast Loading Enabled - Loading Preprocessed Data")
+        print("=" * 60)
+        try:
+            return load_preprocessed_data()
+        except Exception as e:
+            print(f"❌ Fast loading failed: {e}")
+            print("   Falling back to preprocessing from scratch...")
+    
+    print("\n⚙️  Preprocessing Data from Scratch")
+    print("=" * 60)
+    print("💡 Tip: Run 'python data_loader.py' once to enable fast loading")
+    
+    return preprocess_dataset_with_normalization()
+
+
 # --- Main Execution ---
 if __name__ == "__main__":
-    # 1. Preprocess dataset
-    print("\n--- 1. Preprocessing Dataset ---")
+    print(f"\n🎯 TimeMatch Training Pipeline")
+    print(f"   Device: {DEVICE}")
+    print(f"   Normalization: {NORMALIZATION_STRATEGY}")
+    print(f"   Fast Loading: {'✅ Enabled' if USE_FAST_LOADING else '❌ Disabled'}")
+    
+    # 1. Load or preprocess data
+    print("\n--- 1. Data Loading ---")
     (
         kept_parcel_ids,
         filtered_labels,
@@ -909,26 +782,29 @@ if __name__ == "__main__":
         idx_to_crop,
         num_classes,
         dates_doy,
-    ) = preprocess_dataset()
+        normalizer,
+    ) = load_or_preprocess_data()
 
-    print(f"Number of classes: {num_classes}")
-    print(f"Classes: {idx_to_crop}")
-    print(f"Number of parcels: {len(kept_parcel_ids)}")
+    print(f"\n📊 Dataset Summary:")
+    print(f"   Classes: {num_classes}")
+    print(f"   Parcels: {len(kept_parcel_ids)}")
+    print(f"   Normalization: {normalizer.strategy}")
+    print(f"   Classes: {list(idx_to_crop.values())}")
 
     # 2. Create k-fold data loaders
     print("\n--- 2. Creating Data Loaders ---")
-    fold_loaders = create_k_fold_loaders(
+    fold_loaders = create_enhanced_k_fold_loaders(
         parcel_ids=kept_parcel_ids,
         labels_dict=filtered_labels,
         crop_to_idx=crop_to_idx,
         data_path=DATA_PATH,
         dates_doy=dates_doy,
+        normalizer=normalizer,
         num_folds=NUM_FOLDS,
         batch_size=BATCH_SIZE,
         num_pixels_sample=NUM_PIXELS_SAMPLE,
         num_workers=NUM_WORKERS,
         random_seed=RANDOM_SEED,
-        max_pixel_value=PIXEL_NORMALIZATION_MAX,
     )
 
     # 3. Run k-fold cross-validation
@@ -938,32 +814,31 @@ if __name__ == "__main__":
             fold_loaders=fold_loaders, num_classes=num_classes, idx_to_crop=idx_to_crop
         )
 
-        # Print final summary and save it in a text file
+        # Print final summary and save it
         print("\n--- Final Results Summary ---")
+        print(f"Normalization Strategy: {normalizer.strategy}")
         print(f"Mean Validation Metrics across {NUM_FOLDS} Folds:")
-        file_path = Path("results_summary.txt")
+        
+        file_path = Path(f"results_summary_{normalizer.strategy}.txt")
         with open(file_path, "w") as f:
-            f.write("Mean Validation Metrics across {NUM_FOLDS} Folds:\n")
+            f.write(f"Normalization Strategy: {normalizer.strategy}\n")
+            f.write(f"Fast Loading Used: {USE_FAST_LOADING and check_preprocessed_data_exists()}\n")
+            f.write(f"Mean Validation Metrics across {NUM_FOLDS} Folds:\n")
             for metric, value in sorted(results["mean_metrics"].items()):
                 print(f"  {metric}: {value:.4f} ± {results['std_metrics'][metric]:.4f}")
-                f.write(
-                    f"  {metric}: {value:.4f} ± {results['std_metrics'][metric]:.4f}\n"
-                )
+                f.write(f"  {metric}: {value:.4f} ± {results['std_metrics'][metric]:.4f}\n")
     else:
-        print("Error: No data loaders were created.")
+        print("❌ Error: No data loaders were created.")
 
-    # Save the best final fold results
+    # 4. Save the best fold results
     if results and "all_fold_metrics" in results:
-        best_fold_metrics = max(
-            results["all_fold_metrics"], key=lambda x: x.get("val_f1_weighted", 0)
-        )
-        print("\nBest Fold Metrics:")
+        best_fold_metrics = max(results["all_fold_metrics"], key=lambda x: x.get("val_f1_weighted", 0))
+        print(f"\n🏆 Best Fold Metrics:")
         for metric, value in sorted(best_fold_metrics.items()):
             print(f"  {metric}: {value:.4f}")
-        display_confusion_matrix(
-            best_fold_metrics.get("confusion_matrix"),
-            list(idx_to_crop.values()),
-            fold_num=NUM_FOLDS,
-        )
 
-    print("\n--- Done! ---")
+    print(f"\n✅ Training completed!")
+    if USE_FAST_LOADING and check_preprocessed_data_exists():
+        print(f"   ⚡ Fast loading was used - saved preprocessing time")
+    else:
+        print(f"   💡 Run 'python data_loader.py' to enable fast loading for next time")
